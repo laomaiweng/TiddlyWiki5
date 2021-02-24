@@ -15,6 +15,48 @@ A sync adaptor module for synchronising with the local filesystem via node.js AP
 // Get a reference to the file system
 var fs = $tw.node ? require("fs") : null,
 	path = $tw.node ? require("path") : null;
+try {
+	var git = $tw.node ? require("nodegit") : null;
+	var gitState = {
+		op: null,
+		repo: null,
+		sig: null,
+	}
+	gitState.op = git.Repository.open(".").then(async function(repo) {
+		gitState.repo = repo;
+		gitState.sig = await repo.defaultSignature();
+		console.log("Git repository detected.");
+	}).catch(function(err) {
+		console.log("No Git repository detected.");
+	});
+} catch(err) {
+	git = null;
+}
+
+function gitFilePath(filepath) {
+	var relative = path.relative(".", filepath);
+	return relative.split(path.sep).join(path.posix.sep);
+}
+
+function gitCommitChanges(addedFiles, deletedFiles, message) {
+	if (addedFiles.length == 0 && deletedFiles.length == 0)
+		return;
+	gitState.op = gitState.op.then(async function() {
+		var index = await gitState.repo.refreshIndex();
+		for (const filepath of addedFiles) {
+			await index.addByPath(gitFilePath(filepath));
+		}
+		for (const filepath of deletedFiles) {
+			await index.removeByPath(gitFilePath(filepath));
+		}
+		await index.write();
+		var oid = await index.writeTree();
+		var head = await gitState.repo.getHeadCommit();
+		await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+	}).catch(function(reason) {
+		$tw.syncer.logger.log("Commit failed: "+reason);
+	});
+}
 
 function FileSystemAdaptor(options) {
 	var self = this;
@@ -82,7 +124,7 @@ FileSystemAdaptor.prototype.saveTiddler = function(tiddler,callback,options) {
 		if(err) {
 			return callback(err);
 		}
-		$tw.utils.saveTiddlerToFile(tiddler,fileInfo,function(err,fileInfo) {
+		$tw.utils.saveTiddlerToFile(tiddler,fileInfo,function(err,fileInfo,savedFiles) {
 			if(err) {
 				if ((err.code == "EPERM" || err.code == "EACCES") && err.syscall == "open") {
 					fileInfo = fileInfo || self.boot.files[tiddler.fields.title];
@@ -102,7 +144,12 @@ FileSystemAdaptor.prototype.saveTiddler = function(tiddler,callback,options) {
 				bootInfo: fileInfo || {},
 				title: tiddler.fields.title
 			};
-			$tw.utils.cleanupTiddlerFiles(options,function(err,fileInfo) {
+			$tw.utils.cleanupTiddlerFiles(options,function(err,fileInfo,deletedFiles) {
+				if(git) {
+					// Commit changes even if there was an error
+					var message = "Save tiddler \""+tiddler.fields.title+"\"";
+					gitCommitChanges(savedFiles, deletedFiles, message);
+				}
 				if(err) {
 					return callback(err);
 				}
@@ -129,7 +176,12 @@ FileSystemAdaptor.prototype.deleteTiddler = function(title,callback,options) {
 		fileInfo = this.boot.files[title];
 	// Only delete the tiddler if we have writable information for the file
 	if(fileInfo) {
-		$tw.utils.deleteTiddlerFile(fileInfo,function(err,fileInfo) {
+		$tw.utils.deleteTiddlerFile(fileInfo,function(err,fileInfo,deletedFiles) {
+			if(git) {
+				// Commit changes even if there was an error
+				var message = "Delete tiddler \""+title+"\"";
+				gitCommitChanges([], deletedFiles, message);
+			}
 			if(err) {
 				if ((err.code == "EPERM" || err.code == "EACCES") && err.syscall == "unlink") {
 					// Error deleting the file on disk, should fail gracefully

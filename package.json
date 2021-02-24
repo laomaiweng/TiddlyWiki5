@@ -28,6 +28,9 @@
     "eslint": "^7.10.0"
   },
   "bundleDependencies": [],
+  "optionalDependencies": {
+    "nodegit": "^0.27.0"
+  },
   "license": "BSD",
   "engines": {
     "node": ">=0.8.2"
