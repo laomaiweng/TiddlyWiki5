@@ -21,18 +21,20 @@ try {
 		op: null,
 		repo: null,
 		sig: null,
+		commitDrafts: false,
 	}
 	gitState.op = git.Repository.open(".").then(async function(repo) {
 		gitState.repo = repo;
 		gitState.sig = await repo.defaultSignature();
-		console.log("Git repository detected.");
+		$tw.syncer.logger.log("Git repository detected.");
 	}).catch(function(err) {
-		console.log("No Git repository detected.");
+		$tw.syncer.logger.log("No Git repository detected.");
 	});
 } catch(err) {
 	git = null;
 }
 
+// Convert absolute path to repository-relative path
 function gitFilePath(filepath) {
 	var relative = path.relative(".", filepath);
 	return relative.split(path.sep).join(path.posix.sep);
@@ -42,17 +44,35 @@ function gitCommitChanges(addedFiles, deletedFiles, message) {
 	if (addedFiles.length == 0 && deletedFiles.length == 0)
 		return;
 	gitState.op = gitState.op.then(async function() {
+		// Convert into repository paths
+		addedFiles = addedFiles.map(gitFilePath);
+		deletedFiles = deletedFiles.map(gitFilePath);
+		// Update the index
 		var index = await gitState.repo.refreshIndex();
+		var nonEmpty = false;
 		for (const filepath of addedFiles) {
-			await index.addByPath(gitFilePath(filepath));
+			nonEmpty = true; // Always commit if we add files
+			await index.addByPath(filepath);
 		}
 		for (const filepath of deletedFiles) {
-			await index.removeByPath(gitFilePath(filepath));
+			// Don't try to remove (and commit) non-versioned files since it would create empty commits
+			nonEmpty |= await index.find(filepath).then(async function() {
+				// Even though we just found the path we can't use the index to remove it?
+				// So we remove it by looking it up by path again
+				// (Also removeByPath() doesn't return an error if the path doesn't exist in the index so we can't use it instead of find() above.)
+				await index.removeByPath(filepath);
+				return true;
+			}).catch(function() {
+				return false;
+			});
 		}
-		await index.write();
-		var oid = await index.writeTree();
-		var head = await gitState.repo.getHeadCommit();
-		await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+		if (nonEmpty) {
+			// Write the index and commit
+			await index.write();
+			var oid = await index.writeTree();
+			var head = await gitState.repo.getHeadCommit();
+			await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+		}
 	}).catch(function(reason) {
 		$tw.syncer.logger.log("Commit failed: "+reason);
 	});
@@ -145,7 +165,7 @@ FileSystemAdaptor.prototype.saveTiddler = function(tiddler,callback,options) {
 				title: tiddler.fields.title
 			};
 			$tw.utils.cleanupTiddlerFiles(options,function(err,fileInfo,deletedFiles) {
-				if(git) {
+				if(git && (gitState.commitDrafts || !tiddler.isDraft())) {
 					// Commit changes even if there was an error
 					var message = "Save tiddler \""+tiddler.fields.title+"\"";
 					gitCommitChanges(savedFiles, deletedFiles, message);
@@ -179,6 +199,7 @@ FileSystemAdaptor.prototype.deleteTiddler = function(title,callback,options) {
 		$tw.utils.deleteTiddlerFile(fileInfo,function(err,fileInfo,deletedFiles) {
 			if(git) {
 				// Commit changes even if there was an error
+				// (No need to check git.commitDrafts since we won't commit deletion of non-versioned files anyway.)
 				var message = "Delete tiddler \""+title+"\"";
 				gitCommitChanges([], deletedFiles, message);
 			}
