@@ -22,6 +22,7 @@ try {
 		repo: null,
 		sig: null,
 		commitDrafts: false,
+		lastSaved: null,
 	}
 	gitState.op = git.Repository.open(".").then(async function(repo) {
 		gitState.repo = repo;
@@ -40,8 +41,10 @@ function gitFilePath(filepath) {
 	return relative.split(path.sep).join(path.posix.sep);
 }
 
-function gitCommitChanges(addedFiles, deletedFiles, message) {
+function gitCommitChanges(tiddlerTitle, addedFiles, deletedFiles, message, isDraft) {
 	if (addedFiles.length == 0 && deletedFiles.length == 0)
+		return;
+	if (isDraft && !git.commitDrafts)
 		return;
 	gitState.op = gitState.op.then(async function() {
 		// Convert into repository paths
@@ -49,9 +52,9 @@ function gitCommitChanges(addedFiles, deletedFiles, message) {
 		deletedFiles = deletedFiles.map(gitFilePath);
 		// Update the index
 		var index = await gitState.repo.refreshIndex();
-		var nonEmpty = false;
+		var isSaveCommit = addedFiles.length > 0;
+		var nonEmpty = isSaveCommit; // Always commit if we add files
 		for (const filepath of addedFiles) {
-			nonEmpty = true; // Always commit if we add files
 			await index.addByPath(filepath);
 		}
 		for (const filepath of deletedFiles) {
@@ -71,7 +74,15 @@ function gitCommitChanges(addedFiles, deletedFiles, message) {
 			await index.write();
 			var oid = await index.writeTree();
 			var head = await gitState.repo.getHeadCommit();
-			await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+			// If saving the story list or a draft tiddler several times in a row, squash with the previous commit instead of creating a separate one
+			var amend = isSaveCommit && (tiddlerTitle == gitState.lastSaved) && ((tiddlerTitle == '$:/StoryList') || isDraft);
+			if (amend) {
+				await head.amend('HEAD', gitState.sig, gitState.sig, null, message, oid);
+			} else {
+				await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+			}
+			// Remember the tiddler (rather, the main file) we just saved, for commit squashing
+			gitState.lastSaved = isSaveCommit ? tiddlerTitle : null;
 		}
 	}).catch(function(reason) {
 		$tw.syncer.logger.log("Commit failed: "+reason);
@@ -165,10 +176,10 @@ FileSystemAdaptor.prototype.saveTiddler = function(tiddler,callback,options) {
 				title: tiddler.fields.title
 			};
 			$tw.utils.cleanupTiddlerFiles(options,function(err,fileInfo,deletedFiles) {
-				if(git && (gitState.commitDrafts || !tiddler.isDraft())) {
+				if(git) {
 					// Commit changes even if there was an error
 					var message = "Save tiddler \""+tiddler.fields.title+"\"";
-					gitCommitChanges(savedFiles, deletedFiles, message);
+					gitCommitChanges(tiddler.fields.title, savedFiles, deletedFiles, message, tiddler.isDraft());
 				}
 				if(err) {
 					return callback(err);
@@ -199,9 +210,9 @@ FileSystemAdaptor.prototype.deleteTiddler = function(title,callback,options) {
 		$tw.utils.deleteTiddlerFile(fileInfo,function(err,fileInfo,deletedFiles) {
 			if(git) {
 				// Commit changes even if there was an error
-				// (No need to check git.commitDrafts since we won't commit deletion of non-versioned files anyway.)
+				// (We can't tell if it was a draft tiddler or not, since the tiddler object has been deleted already. It's not a problem though, since we won't commit the deletion of a file if it wasn't versioned in the first place.)
 				var message = "Delete tiddler \""+title+"\"";
-				gitCommitChanges([], deletedFiles, message);
+				gitCommitChanges(title, [], deletedFiles, message, false);
 			}
 			if(err) {
 				if ((err.code == "EPERM" || err.code == "EACCES") && err.syscall == "unlink") {
