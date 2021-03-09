@@ -17,19 +17,49 @@ var fs = $tw.node ? require("fs") : null,
 	path = $tw.node ? require("path") : null;
 try {
 	var git = $tw.node ? require("nodegit") : null;
+	// Git state/configuration
 	var gitState = {
 		op: null,
 		repo: null,
-		sig: null,
-		commitDrafts: false,
 		lastSaved: null,
+		doPush: true,
+		pushTimeoutTimer: null,
+		pushIntervalTimer: null,
+		config: {
+			sig: null,
+			commitDrafts: false,
+			remote: {
+				name: 'origin',
+				// Use this to push some time after changes are committed; new changes reset the timeout (this lets a slew of changes accumulate before getting pushed)
+				pushTimeout: 60, // in seconds (<= 0 to disable)
+				// Use this to push at regular intervals; new changes don't alter the interval (this is useful if the remote is not always reachable)
+				pushInterval: 60*60, // in seconds (<= 0 to disable)
+				agentAuth: true,
+				pubkeyAuth: null, // [pubkey, privkey]
+			},
+		},
 	}
+	//TODO: load config from somewhere?
 	gitState.op = git.Repository.open(".").then(async function(repo) {
 		gitState.repo = repo;
-		gitState.sig = await repo.defaultSignature();
+		if (!gitState.config.sig) {
+			gitState.config.sig = await repo.defaultSignature();
+		}
 		$tw.syncer.logger.log("Git repository detected.");
+		if (gitState.config.remote.pushInterval > 0) {
+			// Schedule push on interval
+			gitState.pushIntervalTimer = setInterval(gitPushRepo, gitState.config.remote.pushInterval*1000);
+		}
+		// Do an initial push if configured to push at all
+		if (gitState.config.remote.pushTimeout > 0 || gitState.config.remote.pushInterval > 0) {
+			await gitPushRepo();
+		}
 	}).catch(function(err) {
-		$tw.syncer.logger.log("No Git repository detected.");
+		if (!gitState.repo) {
+			$tw.syncer.logger.log("No Git repository detected.");
+		} else {
+			$tw.syncer.logger.log("Git initialization failed: "+err);
+		}
 	});
 } catch(err) {
 	git = null;
@@ -44,7 +74,7 @@ function gitFilePath(filepath) {
 function gitCommitChanges(tiddlerTitle, addedFiles, deletedFiles, message, isDraft) {
 	if (addedFiles.length == 0 && deletedFiles.length == 0)
 		return;
-	if (isDraft && !git.commitDrafts)
+	if (isDraft && !gitState.config.commitDrafts)
 		return;
 	gitState.op = gitState.op.then(async function() {
 		// Convert into repository paths
@@ -77,15 +107,48 @@ function gitCommitChanges(tiddlerTitle, addedFiles, deletedFiles, message, isDra
 			// If saving the story list or a draft tiddler several times in a row, squash with the previous commit instead of creating a separate one
 			var amend = isSaveCommit && (tiddlerTitle == gitState.lastSaved) && ((tiddlerTitle == '$:/StoryList') || isDraft);
 			if (amend) {
-				await head.amend('HEAD', gitState.sig, gitState.sig, null, message, oid);
+				await head.amend('HEAD', gitState.config.sig, gitState.config.sig, null, message, oid);
 			} else {
-				await gitState.repo.createCommit('HEAD', gitState.sig, gitState.sig, message, oid, [head]);
+				await gitState.repo.createCommit('HEAD', gitState.config.sig, gitState.config.sig, message, oid, [head]);
 			}
-			// Remember the tiddler (rather, the main file) we just saved, for commit squashing
+			// Remember the tiddler we just saved, for commit squashing
 			gitState.lastSaved = isSaveCommit ? tiddlerTitle : null;
+			// Re-schedule push on timeout
+			gitState.doPush = true;
+			if (gitState.config.remote.pushTimeout > 0) {
+				clearTimeout(gitState.pushTimeoutTimer);
+				gitState.pushTimeoutTimer = setTimeout(gitPushRepo, gitState.config.remote.pushTimeout*1000);
+			}
 		}
 	}).catch(function(reason) {
-		$tw.syncer.logger.log("Commit failed: "+reason);
+		$tw.syncer.logger.log("Git commit failed: "+reason);
+	});
+}
+
+function gitPushRepo() {
+	gitState.op = gitState.op.then(async function() {
+		if (!gitState.doPush)
+			return;
+		var options = {
+			callbacks: {
+				credentials: function(url, userName) {
+					if (gitState.config.remote.agentAuth) {
+						return git.Cred.sshKeyFromAgent(userName);
+					} else if (gitState.config.remote.pubkeyAuth) {
+						var [pubkey, privkey] = gitState.config.remote.pubkeyAuth;
+						return git.Cred.sshKeyNew(userName, pubkey, privkey);
+					}
+				}
+			}
+		};
+		var branch = await gitState.repo.getCurrentBranch();
+		var remote = await gitState.repo.getRemote(gitState.config.remote.name);
+		await remote.push([branch.name() + ':' + branch.name()], options);
+		gitState.lastSaved = null; // We just pushed, don't squash next commit
+		$tw.syncer.logger.log("Git repository pushed.");
+		gitState.doPush = false;
+	}).catch(function(reason) {
+		$tw.syncer.logger.log("Git push failed:", reason);
 	});
 }
 
