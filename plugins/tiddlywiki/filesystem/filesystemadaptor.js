@@ -28,6 +28,7 @@ try {
 		config: {
 			sig: null,
 			commitDrafts: false,
+			commitStoryList: true,
 			remote: {
 				name: 'origin',
 				// Use this to push some time after changes are committed; new changes reset the timeout (this lets a slew of changes accumulate before getting pushed)
@@ -76,6 +77,9 @@ function gitCommitChanges(tiddlerTitle, addedFiles, deletedFiles, message, isDra
 		return;
 	if (isDraft && !gitState.config.commitDrafts)
 		return;
+	var isStoryList = tiddlerTitle == '$:/StoryList';
+	if (isStoryList && !gitState.config.commitStoryList)
+		return;
 	gitState.op = gitState.op.then(async function() {
 		// Convert into repository paths
 		addedFiles = addedFiles.map(gitFilePath);
@@ -105,7 +109,7 @@ function gitCommitChanges(tiddlerTitle, addedFiles, deletedFiles, message, isDra
 			var oid = await index.writeTree();
 			var head = await gitState.repo.getHeadCommit();
 			// If saving the story list or a draft tiddler several times in a row, squash with the previous commit instead of creating a separate one
-			var amend = isSaveCommit && (tiddlerTitle == gitState.lastSaved) && ((tiddlerTitle == '$:/StoryList') || isDraft);
+			var amend = isSaveCommit && (tiddlerTitle == gitState.lastSaved) && (isStoryList || isDraft);
 			if (amend) {
 				await head.amend('HEAD', gitState.config.sig, gitState.config.sig, null, message, oid);
 			} else {
